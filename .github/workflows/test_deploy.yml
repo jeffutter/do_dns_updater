@@ -1,0 +1,212 @@
+name: Release
+
+# CI Strategies from: https://matklad.github.io/2021/09/04/fast-rust-builds.html
+
+on:
+  push:
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ${{matrix.os}}
+    container: ${{matrix.container}}
+    strategy:
+      matrix:
+        include:
+        - build: linux
+          os: ubuntu-latest
+          rust: stable
+          target: x86_64-unknown-linux-musl
+          container:
+            image: rust:alpine
+        - build: macos
+          os: macos-latest
+          rust: stable
+          target: x86_64-apple-darwin
+          contanier: ''
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 1
+
+    - name: Install deps
+      if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+      run: |
+        apk add -U cmake make build-base tar
+
+    - name: Install Rust
+      run: |
+        rustup install ${{ matrix.rust }}
+        rustup target add ${{ matrix.target }}
+        rustup show
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: "false"
+
+    - name: Compile
+      run: cargo test --no-run --locked
+
+    - name: Test
+      run: cargo test -- --nocapture --quiet
+
+  publish-to-github:
+    name: Publish to Github
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{matrix.os}}
+    container: ${{matrix.container}}
+    strategy:
+      matrix:
+        include:
+        - build: linux
+          os: ubuntu-latest
+          rust: stable
+          target: x86_64-unknown-linux-musl
+          container:
+            image: rust:alpine
+        - build: macos
+          os: macos-latest
+          rust: stable
+          target: x86_64-apple-darwin
+          contanier: ''
+        - build: macos-aarch64
+          os: macos-latest
+          rust: stable
+          target: aarch64-apple-darwin
+          container: ''
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 1
+
+    - name: Install deps
+      if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+      run: |
+        apk add -U cmake make build-base tar
+
+    - name: Install Rust
+      run: |
+        rustup install ${{ matrix.rust }}
+        rustup target add ${{ matrix.target }}
+        rustup show
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: "false"
+
+    - name: Build
+      run: cargo build --release --target ${{ matrix.target }}
+
+    - name: Package Artifacts
+      run: |
+        src=$(pwd)
+        stage=
+        case $RUNNER_OS in
+            Linux)
+                stage=$(mktemp -d)
+                ;;
+            macOS)
+                stage=$(mktemp -d -t tmp)
+                ;;
+        esac
+
+        cp target/${{ matrix.target }}/release/do-dns-updater $stage/
+        cd $stage
+
+        RELEASE_VERSION=${GITHUB_REF#refs/tags/}
+        ASSET_NAME="do-dns-updater-$RELEASE_VERSION-${{ matrix.target }}.tar.gz"
+        ASSET_PATH="$src/$ASSET_NAME"
+        CHECKSUM_PATH="$ASSET_PATH.sha256"
+
+        echo "BIN_PATH=$stage/do-dns-updater" >> $GITHUB_ENV
+        echo "ASSET_PATH=$ASSET_PATH" >> $GITHUB_ENV
+        echo "CHECKSUM_PATH=$CHECKSUM_PATH" >> $GITHUB_ENV
+
+        tar czf $ASSET_PATH *
+
+        cd $src
+
+        case $RUNNER_OS in
+            Linux)
+                sha256sum $ASSET_NAME > $CHECKSUM_PATH
+                ;;
+            macOS)
+                shasum -a 256 $ASSET_NAME > $CHECKSUM_PATH
+                ;;
+        esac
+
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: |
+          ${{ env.ASSET_PATH }}
+          ${{ env.CHECKSUM_PATH }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Artifact
+      if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+      uses: actions/upload-artifact@v3
+      with:
+        name: binary
+        path: ${{ env.BIN_PATH }}  
+
+  publish-container:
+    name: Publish Container
+    needs: publish-to-github 
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 1
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Log in to the Container registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata (tags, labels) for Docker
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} 
+
+    - name: Download Artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: binary
+        path: ./docker-release
+
+    - name: Build and push
+      uses: docker/build-push-action@v3
+      with:
+        context: ./docker-release
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha, scope=${{ github.workflow }}
+        cache-to: type=gha, scope=${{ github.workflow }}
