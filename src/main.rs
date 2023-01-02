@@ -76,7 +76,7 @@ fn list_do_records(
     let body: ListResponse = agent
         .get(&url)
         .query("type", "A")
-        .query("name", &format!("{}.{}", name, domain))
+        .query("name", &format_name(domain, name))
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {}", token))
         .call()?
@@ -108,6 +108,13 @@ fn update_ip(
         .into_json::<UpdateResponse>()?;
 
     Ok(())
+}
+
+fn format_name(domain: &str, name: &str) -> String {
+    match name {
+        "@" => domain.to_string(),
+        _ => format!("{}.{}", name, domain),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
